@@ -1,1 +1,1 @@
-# AI-Destekli-SQL-Yard-mc-Aray-z--2025-staj
+# AI-Destekli-SQL-Yardımcı Arayüz- (2025 staj)
