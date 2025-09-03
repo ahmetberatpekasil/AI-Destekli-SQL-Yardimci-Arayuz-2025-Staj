@@ -9,8 +9,8 @@ Bu depo, Django ile geliştirilmiş bir web uygulaması iskeletidir. Yapılandı
 
 ## Hızlı Başlangıç
 ```bash
-git clone https://github.com/kullaniciadi/projeadi.git
-cd projeadi
+git clone https://github.com/ahmetberatpekasil/AI-Destekli-SQL-Yardimci-Arayuz-2025-Staj.git
+cd AI-Destekli-SQL-Yardimci-Arayuz-2025-Staj
 
 python -m venv venv
 # Windows (PowerShell):
