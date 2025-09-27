@@ -4,11 +4,12 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from psycopg2 import sql
-from psycopg2.extras import RealDictCursor 
+from psycopg2.extras import RealDictCursor
 
 load_dotenv()
 
 # DB bağlantısı
+
 db_connection = psycopg2.connect(
     host=os.getenv("DB_HOST"),
     dbname=os.getenv("DB_NAME"),
@@ -17,7 +18,9 @@ db_connection = psycopg2.connect(
     port=os.getenv("DB_PORT"),
 )
 
+
 # Güvenli cursor + JSON-dostu dönüşüm
+
 @contextmanager
 def db_cursor():
     cursor = None
@@ -39,15 +42,30 @@ def db_cursor():
 def rows_as_dicts(cursor):
     return list(cursor.fetchall())
 
-# Yardımcılar
-_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-# DDL allow-list: kolon tipi/kısıtı sadece güvenli karakterlerden oluşmalı
-_TYPE_RE = re.compile(r"^[A-Z0-9_(),\s]+$")
+
+# Yardımcılar (normalize / güvenlik)
+
+_IDENTIFIER_RE = re.compile(r"^[a-z_][a-z0-9_]*$")   # normalize sonrası küçük harf
+_TYPE_RE = re.compile(r"^[A-Z0-9_(),\s]+$")          # DDL allow-list (kaba)
+
+def _normalize_ident(name: str) -> str:
+    """
+    Postgres'te tırnaksız isimler case-insensitive gibi davranır (lower’a düşer).
+    Kullanıcı 'Person', '"Users"' vs dese de emniyetli biçimde -> lower + tırnak temizle.
+    """
+    if not isinstance(name, str):
+        raise ValueError("Geçersiz isim türü.")
+    return name.strip().strip('"').lower()
 
 def _ident(name: str) -> sql.Identifier:
-    if not isinstance(name, str) or not _IDENTIFIER_RE.match(name):
-        raise ValueError(f"Geçersiz isim: {name}")
-    return sql.Identifier(name)
+    n = _normalize_ident(name)
+    if not _IDENTIFIER_RE.match(n):
+        raise ValueError(f"Geçersiz isim: {name!r}")
+    return sql.Identifier(n)
+
+def _qualified(schema: str, table: str) -> sql.Composed:
+    """schema.table güvenli biçimde hazırla (ikisi de normalize edilir)."""
+    return sql.SQL("{}.{}").format(_ident(schema), _ident(table))
 
 def _parse(content):
     """
@@ -83,18 +101,40 @@ def _build_where_simple(where: dict):
             params.append(val)
     return (sql.SQL(" WHERE ") + sql.SQL(" AND ").join(clauses), params) if clauses else (sql.SQL(""), [])
 
-# İşlevler 
+def _table_exists(table: str, schema: str = "public") -> bool:
+    """information_schema üzerinden tablo var mı kontrolü (BASE TABLE)."""
+    sch = _normalize_ident(schema)
+    tb = _normalize_ident(table)
+    with db_cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT 1
+            FROM information_schema.tables
+            WHERE table_schema = %s
+              AND table_name   = %s
+              AND table_type   = 'BASE TABLE'
+            LIMIT 1
+            """,
+            [sch, tb],
+        )
+        return cursor.fetchone() is not None
+
+
+# İşlevler (DDL/DML) — tümünde schema opsiyonel (default: public)
+
 def create_sql_table(content: str):
     """
     JSON:
     {
       "table": "person",
+      "schema": "public",  # opsiyonel
       "columns": {"id":"INT PRIMARY KEY","name":"VARCHAR(255)","age":"INT","gender":"CHAR(1)"},
       "if_not_exists": true
     }
     """
     data = _parse(content)
     table = data["table"]
+    schema = data.get("schema") or "public"
     columns = data["columns"]
     if_not_exists = bool(data.get("if_not_exists", True))
     if not isinstance(columns, dict) or not columns:
@@ -102,58 +142,71 @@ def create_sql_table(content: str):
 
     column_defs = []
     for column_name, column_type in columns.items():
-        # DDL allow-list kontrolü (kolon tipi/kısıtı)
         if not isinstance(column_type, str) or not _TYPE_RE.match(column_type.upper()):
             raise ValueError(f"Geçersiz/izin verilmeyen kolon tipi/kısıtı: {column_type!r}")
         column_defs.append(sql.SQL("{} {}").format(_ident(column_name), sql.SQL(column_type)))
 
     query = sql.SQL("CREATE TABLE {}{} ({})").format(
         sql.SQL("IF NOT EXISTS ") if if_not_exists else sql.SQL(""),
-        _ident(table),
+        _qualified(schema, table),
         sql.SQL(", ").join(column_defs),
     )
     with db_cursor() as cursor:
         cursor.execute(query)
-    return f"{table} tablosu oluşturuldu (ya da zaten vardı)."
+    return f"{_normalize_ident(schema)}.{_normalize_ident(table)} oluşturuldu (ya da zaten vardı)."
 
 def drop_sql_table(content: str):
     """
     JSON:
     {
       "table": "person",
-      "if_exists": true,      # opsiyonel (default: true)
-      "cascade": false        # opsiyonel
+      "schema": "public",    # opsiyonel (default: public)
+      "if_exists": true,     # opsiyonel (default: true)
+      "cascade": false       # opsiyonel
     }
     """
     data = _parse(content)
     table = data["table"]
+    schema = data.get("schema") or "public"
     if_exists = bool(data.get("if_exists", True))
     cascade = bool(data.get("cascade", False))
+
+    exists = _table_exists(table, schema)
+    if not exists:
+        if if_exists:
+            return f"{_normalize_ident(schema)}.{_normalize_ident(table)} bulunamadı (zaten yok)."
+        raise ValueError(f"Tablo yok: {schema}.{table}")
+
     query = sql.SQL("DROP TABLE {}{}{}").format(
         sql.SQL("IF EXISTS ") if if_exists else sql.SQL(""),
-        _ident(table),
+        _qualified(schema, table),
         sql.SQL(" CASCADE") if cascade else sql.SQL(""),
     )
     with db_cursor() as cursor:
         cursor.execute(query)
-    return f"{table} tablosu silindi." if if_exists else f"{table} tablosu drop komutu uygulandı."
+    return f"{_normalize_ident(schema)}.{_normalize_ident(table)} silindi."
 
 def insert_sql_entry(content: str):
     """
-    JSON: {"table":"person","values":{"id":1,"name":"Mike","age":30,"gender":"m"}}
+    JSON:
+      {"table":"person","schema":"public","values":{"id":1,"name":"Mike","age":30,"gender":"m"}}
+    Not: Tablo mevcut değilse hata döner.
     """
     data = _parse(content)
     table = data["table"]
+    schema = data.get("schema") or "public"
     values = data["values"]
     if not isinstance(values, dict) or not values:
         raise ValueError("'values' dict olmalı ve boş olmamalı.")
+    if not _table_exists(table, schema):
+        raise ValueError(f"Tablo yok: {schema}.{table}")
 
     column_identifiers = [_ident(k) for k in values.keys()]
     params = list(values.values())
     placeholders = sql.SQL(", ").join(sql.Placeholder() for _ in column_identifiers)
 
     query = sql.SQL("INSERT INTO {} ({}) VALUES ({}) RETURNING *").format(
-        _ident(table), sql.SQL(", ").join(column_identifiers), placeholders
+        _qualified(schema, table), sql.SQL(", ").join(column_identifiers), placeholders
     )
     with db_cursor() as cursor:
         cursor.execute(query, params)
@@ -165,16 +218,22 @@ def read_sql_entry(content: str):
     JSON:
     {
       "table":"person",
+      "schema":"public",
       "columns":["id","name"],         # opsiyonel; yoksa "*"
-      "where":{"name":"Bob","id":[1]}  # opsiyonel
+      "where":{"name":"Bob","id":[1]}, # opsiyonel
+      "limit":50                       # opsiyonel
     }
     """
     data = _parse(content)
     table = data["table"]
+    schema = data.get("schema") or "public"
     columns = data.get("columns")
+    if not _table_exists(table, schema):
+        raise ValueError(f"Tablo yok: {schema}.{table}")
+
     col_sql = sql.SQL(", ").join(_ident(c) for c in columns) if columns else sql.SQL("*")
     where_sql, params = _build_where_simple(data.get("where", {}))
-    query = sql.SQL("SELECT {} FROM {}").format(col_sql, _ident(table)) + where_sql
+    query = sql.SQL("SELECT {} FROM {}").format(col_sql, _qualified(schema, table)) + where_sql
 
     limit = data.get("limit")
     if isinstance(limit, int) and limit > 0:
@@ -187,16 +246,19 @@ def read_sql_entry(content: str):
 
 def delete_sql_entry(content: str):
     """
-    JSON: {"table":"person","where":{"id":1}}  # WHERE zorunlu
+    JSON: {"table":"person","schema":"public","where":{"id":1}}  # WHERE zorunlu
     """
     data = _parse(content)
     table = data["table"]
+    schema = data.get("schema") or "public"
     where = data.get("where")
     if not where:
         raise ValueError("Güvenlik için WHERE zorunludur.")
+    if not _table_exists(table, schema):
+        raise ValueError(f"Tablo yok: {schema}.{table}")
 
     where_sql, params = _build_where_simple(where)
-    query = sql.SQL("DELETE FROM {}").format(_ident(table)) + where_sql + sql.SQL(" RETURNING *")
+    query = sql.SQL("DELETE FROM {}").format(_qualified(schema, table)) + where_sql + sql.SQL(" RETURNING *")
 
     with db_cursor() as cursor:
         cursor.execute(query, params)
@@ -205,10 +267,11 @@ def delete_sql_entry(content: str):
 
 def update_sql_entry(content: str):
     """
-    JSON: {"table":"person","set":{"name":"Veli"},"where":{"id":1}}
+    JSON: {"table":"person","schema":"public","set":{"name":"Veli"},"where":{"id":1}}
     """
     data = _parse(content)
     table = data["table"]
+    schema = data.get("schema") or "public"
     set_map = data.get("set")
     where = data.get("where")
 
@@ -216,6 +279,8 @@ def update_sql_entry(content: str):
         raise ValueError("'set' dict olmalı ve boş olmamalı.")
     if not where:
         raise ValueError("Güvenlik için WHERE zorunludur.")
+    if not _table_exists(table, schema):
+        raise ValueError(f"Tablo yok: {schema}.{table}")
 
     set_clauses = []
     params = []
@@ -225,7 +290,7 @@ def update_sql_entry(content: str):
 
     where_sql, where_params = _build_where_simple(where)
     query = (
-        sql.SQL("UPDATE {} SET ").format(_ident(table))
+        sql.SQL("UPDATE {} SET ").format(_qualified(schema, table))
         + sql.SQL(", ").join(set_clauses)
         + where_sql
         + sql.SQL(" RETURNING *")
@@ -240,9 +305,10 @@ def list_tables(content: str):
     """
     JSON (opsiyonel alanlar):
       {"schema":"public","include_views":false,"pattern":"user","limit":200}
+    Not: Varsayılan schema="public"
     """
-    data = _parse(content)
-    schema = data.get("schema")
+    data = _parse(content) if content else {}
+    schema = data.get("schema") or "public"
     include_views = bool(data.get("include_views", False))
     pattern = data.get("pattern")
     limit = data.get("limit", 200)
@@ -255,11 +321,10 @@ def list_tables(content: str):
 
     if schema:
         where_sql.append(sql.SQL("table_schema = {}").format(sql.Placeholder()))
-        params.append(schema)
+        params.append(_normalize_ident(schema))
 
     if pattern:
-        # wildcard yoksa baş/sona % ekleyelim (ILIKE ile case-insensitive arama)
-        pat = pattern if any(ch in pattern for ch in ("%","_")) else f"%{pattern}%"
+        pat = pattern if any(ch in pattern for ch in ("%", "_")) else f"%{pattern}%"
         where_sql.append(sql.SQL("table_name ILIKE {}").format(sql.Placeholder()))
         params.append(pat)
 
@@ -277,7 +342,9 @@ def list_tables(content: str):
         rows = rows_as_dicts(cursor)
     return {"count": len(rows), "tables": rows}
 
-# LLM tool setup 
+
+# LLM tool setup
+
 API_KEY = (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
 if not API_KEY:
     print("API key bulunamadı (.env -> GEMINI_API_KEY)."); sys.exit(1)
@@ -288,42 +355,42 @@ MODEL = "gemini-2.5-flash"
 tools = types.Tool(function_declarations=[
     types.FunctionDeclaration(
         name="create_sql_table",
-        description="Create a SQL table. JSON: {\"table\":\"...\",\"columns\":{\"col\":\"TYPE ...\"},\"if_not_exists\":true}",
+        description="Create a SQL table. JSON: {\"table\":\"...\",\"schema\":\"public\",\"columns\":{\"col\":\"TYPE ...\"},\"if_not_exists\":true}",
         parameters=types.Schema(type="OBJECT",
             properties={"content": types.Schema(type="STRING", description="JSON string")},
             required=["content"]),
     ),
     types.FunctionDeclaration(
         name="drop_sql_table",
-        description="Drop a SQL table. JSON: {\"table\":\"...\",\"if_exists\":true,\"cascade\":false}",
+        description="Drop a SQL table. JSON: {\"table\":\"...\",\"schema\":\"public\",\"if_exists\":true,\"cascade\":false}",
         parameters=types.Schema(type="OBJECT",
             properties={"content": types.Schema(type="STRING", description="JSON string")},
             required=["content"]),
     ),
     types.FunctionDeclaration(
         name="insert_sql_entry",
-        description="Insert a row. JSON: {\"table\":\"...\",\"values\":{\"col\":val,...}}",
+        description="Insert a row. JSON: {\"table\":\"...\",\"schema\":\"public\",\"values\":{\"col\":val,...}}",
         parameters=types.Schema(type="OBJECT",
             properties={"content": types.Schema(type="STRING", description="JSON string")},
             required=["content"]),
     ),
     types.FunctionDeclaration(
         name="read_sql_entry",
-        description="Read rows. JSON: {\"table\":\"...\",\"columns\":[...],\"where\":{...},\"limit\":N}",
+        description="Read rows. JSON: {\"table\":\"...\",\"schema\":\"public\",\"columns\":[...],\"where\":{...},\"limit\":N}",
         parameters=types.Schema(type="OBJECT",
             properties={"content": types.Schema(type="STRING", description="JSON string")},
             required=["content"]),
     ),
     types.FunctionDeclaration(
         name="delete_sql_entry",
-        description="Delete rows (WHERE required). JSON: {\"table\":\"...\",\"where\":{...}}",
+        description="Delete rows (WHERE required). JSON: {\"table\":\"...\",\"schema\":\"public\",\"where\":{...}}",
         parameters=types.Schema(type="OBJECT",
             properties={"content": types.Schema(type="STRING", description="JSON string")},
             required=["content"]),
     ),
     types.FunctionDeclaration(
         name="update_sql_entry",
-        description="Update rows (WHERE required). JSON: {\"table\":\"...\",\"set\":{...},\"where\":{...}}",
+        description="Update rows (WHERE required). JSON: {\"table\":\"...\",\"schema\":\"public\",\"set\":{...},\"where\":{...}}",
         parameters=types.Schema(type="OBJECT",
             properties={"content": types.Schema(type="STRING", description="JSON string")},
             required=["content"]),
@@ -349,11 +416,12 @@ GEN_CONFIG = types.GenerateContentConfig(
         "\n"
         # Çıktı stili
         "- Günlük sorularda: gerekirse maddelerle, kısa örnek/verim odaklı yanıt ver.\n"
-        "- Teknik yanıtlarda: mümkün oldukça kesin ifade kullan; gereksiz süsleme yapma.\n"
+        "- Teknik yanıtlarda: kesin/yalın anlat; gereksiz uzatma yapma.\n"
         "\n"
         # SQL niyet tespiti ve araçlar
-        "Kullanıcı SQL niyeti taşıyorsa uygun aracı çağır. İçerik numunesi: tablo/kolon isimleri, "
-        "filtreler, değerler. Araç çağrıları her zaman `content` içinde **JSON string** ile yapılır "
+        "Kullanıcı SQL niyeti taşıyorsa uygun aracı çağır. İçerik eksikse önce **kısa** netleştirme sorusu sor; "
+        "ama eksikliği makul güvenli varsayımlarla tamamlayabiliyorsan doğrudan tool-call üret. "
+        "Araç çağrıları her zaman `content` içinde **JSON string** ile yapılır "
         "(eğer JSON obje verilmişse string’e çevir). WHERE sade mod: tek değer (=), liste/tuple (IN), None (IS NULL).\n"
         "\n"
         "EŞANLAMLILAR / TETİKLEYİCİLER -> FONKSİYON HARİTASI:\n"
@@ -366,13 +434,14 @@ GEN_CONFIG = types.GenerateContentConfig(
         "- 'tablolar', 'tabloları listele', 'list tables', 'schema listesi' -> list_tables\n"
         "\n"
         # Örnekler
-        "• 'person'ı güncelle (id=1, name=Veli) -> {\"table\":\"person\",\"set\":{\"name\":\"Veli\"},\"where\":{\"id\":1}}\n"
+        "• 'Users tablosuna ahmet,22,m ekle' -> tablo adı/kolonlar eksikse KISA sor; aksi halde "
+        "{\"table\":\"users\",\"schema\":\"public\",\"values\":{\"name\":\"ahmet\",\"age\":22,\"gender\":\"m\"}}\n"
         "• 'public şemasındaki tabloları listele' -> {\"schema\":\"public\",\"include_views\":false}\n"
         "\n"
         # Güvenlik
         "Tablo/kolon adları yalnızca geçerli tanımlayıcılar olmalı; kolon tipleri güvenli karakterlerden oluşmalı. "
         "Okuma işlemlerinde makul limitler kullan (varsayılan 100; kullanıcı belirtirse onu uygula). "
-        "Anlaşılmayan eksik bilgi varsa KISA netleştirme sorusu sor.\n"
+        "Anlaşılmayan bilgi varsa **tek cümlelik** netleştirme sorusu sor.\n"
     ),
 )
 
@@ -402,61 +471,110 @@ def extract_function_call(response):
                     return part.function_call
     return None
 
-def handle_user_message(user_text: str) -> str:
+
+# Hafızalı + retry'li LLM akışı
+
+def _to_contents_with_history(history, user_text):
+    """
+    history: [{"role":"user"/"assistant","text":"..."}]
+    Gemini için types.Content listesine dönüştürür (hafızalı sohbet).
+    """
+    contents = []
+    for m in (history or []):
+        role = "user" if m.get("role") == "user" else "model"
+        text = (m.get("text") or "").strip()
+        if not text:
+            continue
+        contents.append(types.Content(role=role, parts=[types.Part.from_text(text=text)]))
+    contents.append(types.Content(role="user", parts=[types.Part.from_text(text=user_text)]))
+    return contents
+def handle_user_message(user_text: str, history=None) -> str:
+    # 1) Geçmişle ilk deneme
     first = client.models.generate_content(
         model=MODEL,
-        contents=[types.Content(role="user", parts=[types.Part.from_text(text=user_text)])],
+        contents=_to_contents_with_history(history, user_text),
         config=GEN_CONFIG,
     )
-
     function_call = extract_function_call(first)
     if not function_call:
-        return extract_text_parts(first) or "Boş yanıt."
+        # 2) SQL niyeti varsa bir kez tool-call'a zorla
+        first_text = extract_text_parts(first) or ""
+        likely_sql = any(k in user_text.lower() for k in [
+            "tablo", "insert", "select", "sil", "delete", "güncelle", "update",
+            "upsert", "schema", "sütun", "column", "table", "rows", "record"
+        ])
+        if likely_sql:
+            force_tool_cfg = types.GenerateContentConfig(
+                tools=[tools],
+                temperature=0.2,
+                system_instruction=GEN_CONFIG.system_instruction + "\nLütfen mümkünse bir veritabanı aracı çağrısı üret. Yanıtın tool-call olmalı."
+            )
+            retry = client.models.generate_content(
+                model=MODEL,
+                contents=_to_contents_with_history(history, user_text),
+                config=force_tool_cfg,
+            )
+            function_call = extract_function_call(retry)
+            if not function_call:
+                return extract_text_parts(retry) or first_text or "Bir şey anlayamadım, biraz daha açar mısın?"
+        else:
+            # SQL değilse normal metin döndür
+            return extract_text_parts(first) or "Boş yanıt."
+
+    # 3) Tool çağrısını çalıştır
 
     args = function_call.args if isinstance(function_call.args, dict) else dict(function_call.args)
     name = (function_call.name or "").strip()
 
     try:
+        content_arg = args.get("content")
+        if not isinstance(content_arg, str):
+            content_arg = json.dumps(content_arg, ensure_ascii=False)
+
         if name == "create_sql_table":
-            result = create_sql_table(args.get("content"))
+            result = create_sql_table(content_arg)
             tool_result = {"ok": True, "message": f"Tablo oluşturma sonucu: {result}"}
         elif name == "drop_sql_table":
-            result = drop_sql_table(args.get("content"))
+            result = drop_sql_table(content_arg)
             tool_result = {"ok": True, "message": result}
         elif name == "insert_sql_entry":
-            created = insert_sql_entry(args.get("content"))
+            created = insert_sql_entry(content_arg)
             tool_result = {"ok": True, "message": "Oluşturuldu", "data": created}
         elif name == "read_sql_entry":
-            read = read_sql_entry(args.get("content"))
+            read = read_sql_entry(content_arg)
             tool_result = {"ok": True, "message": "Bilgiler", "data": read}
         elif name == "delete_sql_entry":
-            deleted = delete_sql_entry(args.get("content"))
+            deleted = delete_sql_entry(content_arg)
             tool_result = {"ok": True, "message": "Silindi", "data": deleted}
         elif name == "update_sql_entry":
-            updated = update_sql_entry(args.get("content"))
+            updated = update_sql_entry(content_arg)
             tool_result = {"ok": True, "message": "Güncellendi", "data": updated}
         elif name == "list_tables":
-            lst = list_tables(args.get("content"))
+            lst = list_tables(content_arg)
             tool_result = {"ok": True, "message": "Tablolar", "data": lst}
         else:
             tool_result = {"ok": False, "error": f"Bilinmeyen tool: {name}"}
     except Exception as exc:
         tool_result = {"ok": False, "error": str(exc)}
 
+    # 4) Tool çıktısını modele geri verip son cevabı üret
+
     tool_part = types.Part.from_function_response(name=name, response=tool_result)
     second = client.models.generate_content(
         model=MODEL,
-        contents=[
-            types.Content(role="user", parts=[types.Part.from_text(text=user_text)]),
-            first.candidates[0].content,
+        contents=_to_contents_with_history(history, user_text) + [
             types.Content(role="tool", parts=[tool_part]),
         ],
         config=GEN_CONFIG,
     )
     return extract_text_parts(second) or tool_result.get("message", str(tool_result))
 
+
+# CLI demo
+
 if __name__ == "__main__":
     print("Sohbet açık. Çıkış için '.' yazın.")
+    chat_history = []
     try:
         while True:
             user_input = input("Siz: ").strip()
@@ -465,7 +583,11 @@ if __name__ == "__main__":
                 break
             if not user_input:
                 continue
-            print("Asistan:", handle_user_message(user_input))
+            reply = handle_user_message(user_input, history=chat_history)
+            print("Asistan:", reply)
+            # basit hafıza (CLI): hem kullanıcı hem yanıtı ekleyelim
+            chat_history.append({"role": "user", "text": user_input})
+            chat_history.append({"role": "assistant", "text": reply})
     except KeyboardInterrupt:
         print("\nİptal edildi.")
     finally:
